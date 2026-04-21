@@ -1,0 +1,241 @@
+# =========================================
+# 🚀 NEXUS FUTURE ENGINE 🚀
+# FINAL v27 (ALL FEATURES + ACCURACY SELECT)
+# Developer: Chandan
+# =========================================
+
+import pandas as pd
+from datetime import datetime, timedelta
+import pytz
+import requests
+
+BOT_NAME = "NEXUS FUTURE ENGINE"
+DEVELOPER = "Chandan"
+
+IST = pytz.timezone("Asia/Kolkata")
+
+SETTINGS = {
+    "market": None,
+    "timeframe": None,
+    "from_time": None,
+    "to_time": None,
+    "pairs": [],
+    "accuracy": 72
+}
+
+ALL_PAIRS = [
+    "USDBRL-OTC","USDNGN-OTC","USDCOP-OTC","USDARS-OTC",
+    "USDCLP-OTC","USDPEN-OTC","USDTRY-OTC","USDPKR-OTC",
+    "USDBDT-OTC","USDZAR-OTC","USDSGD-OTC","USDTHB-OTC","USDHKD-OTC",
+    "EURUSD","EURGBP","EURJPY","GBPJPY","AUDJPY","EURAUD","GBPAUD",
+    "EURCHF","GBPCHF","AUDCHF","CADJPY","CHFJPY","NZDJPY",
+    "EURCAD","GBPCAD","AUDCAD","NZDCAD","EURNZD","GBPNZD","AUDNZD"
+]
+
+LAST_SIGNALS = []
+
+# ========= SETUP =========
+def setup():
+    while True:
+        m = input("Market (OTC/LIVE): ").upper()
+        if m in ["OTC","LIVE"]:
+            SETTINGS["market"] = m
+            break
+
+    while True:
+        try:
+            tf = int(input("Timeframe (1/2/5/15): "))
+            if tf in [1,2,5,15]:
+                SETTINGS["timeframe"] = tf
+                break
+        except:
+            pass
+
+    SETTINGS["from_time"] = input("From (HH:MM): ")
+    SETTINGS["to_time"] = input("To (HH:MM): ")
+
+    while True:
+        try:
+            acc = int(input("Accuracy (72-100): "))
+            if 72 <= acc <= 100:
+                SETTINGS["accuracy"] = acc
+                break
+        except:
+            pass
+
+    print("Available Pairs:")
+    print(", ".join(ALL_PAIRS))
+
+    pairs = input("Select pairs: ").upper().split(",")
+    SETTINGS["pairs"] = [p.strip() for p in pairs if p.strip() in ALL_PAIRS]
+
+# ========= DATA =========
+def get_data():
+    try:
+        url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=200"
+        data = requests.get(url).json()
+
+        df = pd.DataFrame(data, columns=["time","open","high","low","close","volume","_","_","_","_","_","_"])
+
+        for col in ["open","high","low","close"]:
+            df[col] = df[col].astype(float)
+
+        df["ema50"] = df["close"].ewm(span=50).mean()
+        df["ema200"] = df["close"].ewm(span=200).mean()
+
+        delta = df["close"].diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = -delta.clip(upper=0).rolling(14).mean()
+        rs = gain / loss
+        df["rsi"] = 100 - (100/(1+rs))
+
+        return df
+    except:
+        return None
+
+# ========= MODELS =========
+def prediction_model(df):
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    trend = 1 if last["ema50"] > last["ema200"] else -1
+    momentum = 1 if last["close"] > prev["close"] else -1
+
+    reversal = 0
+    if last["rsi"] > 70: reversal = -1
+    elif last["rsi"] < 30: reversal = 1
+
+    return trend + momentum + reversal
+
+def logic_model(df):
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    score = 0
+
+    if last["ema50"] > last["ema200"]:
+        score += 2
+    else:
+        score -= 2
+
+    body = abs(last["close"] - last["open"])
+    wick = last["high"] - last["low"]
+
+    if body > wick * 0.5:
+        if last["close"] > last["open"]:
+            score += 2
+        else:
+            score -= 2
+
+    if last["high"] > prev["high"]:
+        score += 1
+    if last["low"] < prev["low"]:
+        score -= 1
+
+    return score
+
+# ========= ENGINES =========
+def live_engine(df):
+    score = logic_model(df) + prediction_model(df)
+    prob = min(abs(score)*15,95)
+    if abs(score) < 3:
+        return None, prob
+    return ("CALL" if score>0 else "PUT"), prob
+
+def otc_engine(df):
+    score = logic_model(df) + prediction_model(df)
+    prob = min(abs(score)*18,95)
+    if abs(score) < 2:
+        return None, prob
+    return ("CALL" if score>0 else "PUT"), prob
+
+# ========= BACKTEST =========
+def backtest(df):
+    wins = 0
+    total = 20
+    for i in range(-total,-1):
+        sub = df.iloc[:i]
+        signal,_ = live_engine(sub)
+        if signal:
+            nxt = df.iloc[i+1]
+            if (signal=="CALL" and nxt["close"]>nxt["open"]) or \
+               (signal=="PUT" and nxt["close"]<nxt["open"]):
+                wins += 1
+    return int((wins/total)*100)
+
+# ========= SIGNAL =========
+def generate():
+    global LAST_SIGNALS
+
+    now = datetime.now(IST)
+    df = get_data()
+    winrate = backtest(df) if df is not None else 50
+
+    signals = []
+
+    for i in range(1,60):
+        t = (now + timedelta(minutes=i*SETTINGS["timeframe"])).strftime("%H:%M")
+
+        if not (SETTINGS["from_time"] <= t <= SETTINGS["to_time"]):
+            continue
+
+        for pair in SETTINGS["pairs"]:
+
+            if SETTINGS["market"] == "OTC":
+                if "OTC" not in pair: continue
+                signal, prob = otc_engine(df)
+            else:
+                if "OTC" in pair: continue
+                if df is None: continue
+                signal, prob = live_engine(df)
+
+            if signal:
+                prob = min(prob*0.7 + winrate*0.3,95)
+
+                if prob >= SETTINGS["accuracy"]:
+                    icon = "🟢📈" if signal=="CALL" else "🔴📉"
+                    tier = "💎 VIP" if prob>=85 else "🔥 PREMIUM"
+
+                    signals.append(f"""
+╔════════════════════╗
+🚀 {BOT_NAME}
+👨‍💻 Dev: {DEVELOPER}
+╚════════════════════╝
+{icon} {pair} ({SETTINGS['market']})
+⏰ {t} ⏳ M{SETTINGS['timeframe']}
+🔮 {signal}
+📊 {int(prob)}% {tier}
+━━━━━━━━━━━━━━━━━━
+""")
+                    break
+
+        if len(signals) >= 10:
+            break
+
+    LAST_SIGNALS = signals
+    return signals
+
+# ========= ADMIN =========
+def admin():
+    while True:
+        print("""
+1. Setup
+2. Generate Signals
+3. Show Last Signals
+4. Exit
+""")
+        ch = input("Select: ")
+
+        if ch == "1":
+            setup()
+        elif ch == "2":
+            generate()
+            print("✅ Signals Generated")
+        elif ch == "3":
+            for s in LAST_SIGNALS:
+                print(s)
+        elif ch == "4":
+            break
+
+# ========= RUN =========
+admin()
